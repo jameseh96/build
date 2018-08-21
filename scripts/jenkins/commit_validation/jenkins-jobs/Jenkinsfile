@@ -1,0 +1,415 @@
+/**
+ * Jenkinsfile CV Pipeline
+ *
+ * Defines a pipeline to be used in Jenkins jobs. Remplements
+ * single-project-gerrit and single-project-clang_analyzer.
+ * This pipline supports linux, ThreadSanitizer, AddressSanitizer &
+ * UndefinedBehaviourSanitizer, and clang_analyzer (static analysis) jobs.
+ * [Documentation](README.md)
+ */
+
+import hudson.Util
+
+
+// When true, jobs using this Jenkinsfile will report "informational" votes
+// and will not cause an overall -1 Verification if they fail.
+// This is useful when forking to testing new jobs or changes to the pipeline.
+
+SILENT = false
+
+WINDOWS_NODE_LABEL = "msvc2015"
+LINUX_NODE_LABEL = "ubuntu-1604"
+
+
+pipeline {
+    options {
+        buildDiscarder(logRotator(daysToKeepStr: '30', numToKeepStr: '',
+                                  artifactDaysToKeepStr: '2',
+                                  artifactNumToKeepStr: ''))
+    }
+    agent { label getNodeLabel() }
+    stages {
+        stage("Checkout Repo"){
+            steps {
+                script {
+                    // Manually tracking run time as
+                    // currentBuild.durationString includes time spent
+                    // waiting for a node
+                    env.startTime = System.currentTimeMillis()
+                }
+                checkout([$class: 'RepoScm',
+                    currentBranch: true,
+
+                    // To use multiple jobs in the repo sync (equivalent to -j ) use
+                    // jobs: PARALLELISM,
+                    // However this may not currently work on windows
+
+                    manifestFile: "${getManifestFileName()}",
+                    manifestGroup: 'build,kv',
+                    manifestRepositoryUrl: 'git://github.com/couchbase/manifest.git',
+                    quiet: true,
+                    resetFirst: false])
+                script {
+                    // Configure Gerrit Trigger
+                    properties([pipelineTriggers([gerrit(silentMode: SILENT,
+                        customUrl: '',
+                        serverName: 'review.couchbase.org',
+                        silentStartMode: true,
+                        gerritProjects: [[branches: [[compareType: 'PLAIN',
+                                                      pattern: env.BRANCH_NAME]],
+                                          compareType: 'PLAIN',
+                                          disableStrictForbiddenFileVerification: false,
+                                          pattern: getProjectName()]],
+                        triggerOnEvents: [patchsetCreated(excludeDrafts: true,
+                                                          excludeNoCodeChange: false,
+                                                          excludeTrivialRebase: false),
+                                          draftPublished()])])])
+                }
+            }
+        }
+
+        stage("Prepare Environment"){
+            steps {
+                // look for config files which specify env vars
+                loadEnvFiles()
+
+                // Common script run by various Jenkins commit-validation builds.
+                //
+                // Checks out all the gerrit changes with change-ids matching
+                // $GERRIT_PATCHSET_REVISION in an appropriate branch for the current
+                // manifest from Gerrit server GERRIT_HOST:GERRIT_PORT, compiles and then
+                // runs unit tests for GERRIT_PROJECT (if applicable).
+                script {
+                    requiredEnvVars = ['GERRIT_HOST',
+                                       'GERRIT_PORT',
+                                       'GERRIT_PROJECT',
+                                       'GERRIT_PATCHSET_REVISION',
+                                       'GERRIT_REFSPEC',
+                                       'GERRIT_CHANGE_ID']
+
+                    for (var in requiredEnvVars) {
+                        if (!env.getProperty(var)){
+                            error "Required environment variable '${var}' not set."
+                        }
+                    }
+
+                    // Optional env vars - how many jobs to run in parallel by default?
+                    env.PARALLELISM = env.PARALLELISM ? env.PARALLELISM : 8;
+
+                    // Set default TEST_PARALLELISM to 4 - many of our tests are actually
+                    // multi-threaded (unlike the compiler) and hence running 8 tests in
+                    // parallel (each with multiple threads) can overload the CV machines
+                    // and cause test timeouts.
+                    env.TEST_PARALLELISM = env.TEST_PARALLELISM ? env.TEST_PARALLELISM : 4;
+
+                    env.BASEDIR = "${pwd()}/cbbuild/scripts/jenkins/commit_validation/"
+
+                    if (env.ENABLE_CODE_COVERAGE) {
+                       env.CMAKE_ARGS="${CMAKE_ARGS} -DCB_CODE_COVERAGE=ON"
+                    }
+                    if (env.ENABLE_THREADSANITIZER) {
+                       env.CMAKE_ARGS="${CMAKE_ARGS} -DCB_THREADSANITIZER=ON"
+                    }
+                    if (env.ENABLE_ADDRESSSANITIZER) {
+                       env.CMAKE_ARGS="${CMAKE_ARGS} -DCB_ADDRESSSANITIZER=${ENABLE_ADDRESSSANITIZER}"
+                    }
+                    if (env.ENABLE_UNDEFINEDSANITIZER) {
+                       env.CMAKE_ARGS="${CMAKE_ARGS} -DCB_UNDEFINEDSANITIZER=${ENABLE_UNDEFINEDSANITIZER}"
+                    }
+                    if (env.ENABLE_CBDEPS_TESTING) {
+                       env.CMAKE_ARGS="${CMAKE_ARGS} -DCB_DOWNLOAD_DEPS_REPO="+
+                       "http://latestbuilds.service.couchbase.com/builds/releases/cbdeps"
+                    }
+                    if (env.GERRIT_PROJECT == "ns_server") {
+                        env.BUILD_DIR="${GERRIT_PROJECT}/build"
+                    }
+                    else if (env.GOPROJECT) {
+                        env.BUILD_DIR="build/goproj/src/github.com/couchbase/${GERRIT_PROJECT}"
+                    } else {
+                        env.BUILD_DIR="build/${GERRIT_PROJECT}"
+                    }
+                }
+
+                sh 'ulimit -a'
+                echo ""
+                sh 'env | grep -iv password | grep -iv passwd | sort'
+            }
+        }
+
+        stage("Clean"){
+            steps {
+                sh 'make clean-xfd-hard'
+                sh 'rm -fr install'
+                sh 'rm -f build/CMakeCache.txt'
+
+                // Zero ccache stats, so we can measure how much space this build is
+                // consuming.
+                sh 'ccache -z'
+
+                // Wipe out any core files left from a previous run.
+                sh ' rm -f /tmp/core.*'
+            }
+        }
+
+        stage("Build"){
+            when {
+                // Do not run this build stage if this is a static analysis job
+                // - the "Static Analysis" stage will do the required work.
+                expression { getJobType() != 'clang_analyzer' }
+            }
+            steps {
+                sh '${BASEDIR}/checkout_dependencies.py ' +
+                '$GERRIT_PATCHSET_REVISION $GERRIT_CHANGE_ID $GERRIT_PROJECT $GERRIT_REFSPEC'
+                script {
+                    if (env.ENABLE_CBDEPS_TESTING) {
+                       sh 'rm -rf ~/.cbdepscache'
+                       sh 'rm -rf build/tlm/deps'
+                    }
+                }
+
+                sh 'make -j${PARALLELISM} EXTRA_CMAKE_OPTIONS="${CMAKE_ARGS}"'
+                sh 'ccache -s'
+            }
+        }
+
+
+        stage("Test"){
+            when {
+                expression { getJobType() != 'clang_analyzer' }
+            }
+            steps {
+                script {
+                    if (env.GOPROJECT || fileExists("${BUILD_DIR}/Makefile")) {
+                        dir(env.BUILD_DIR) {
+                            if (env.ENABLE_CODE_COVERAGE) {
+                                // Reset code coverage counters (note optional hence the || true).
+                                sh 'make ${GERRIT_PROJECT}-coverage-zero-counters || true'
+                            }
+
+                            // -j${TEST_PARALLELISM} : Run tests in parallel.
+                            // -T Test   : Generate XML output file of test results.
+                            sh 'make test ARGS="-j${TEST_PARALLELISM} --output-on-failure \
+                                --no-compress-output -T Test --exclude-regex \\"${TESTS_EXCLUDE}\\""'
+
+                            // Generate code coverage report in XML format for Jenkins plugin.
+                            if (env.ENABLE_CODE_COVERAGE) {
+                                sh 'make ${GERRIT_PROJECT}-coverage-report-xml || true'
+                            }
+                        }
+                    } else {
+                        echo """
+                        ============================================
+                        ===  ${GERRIT_PROJECT} is not a Go project. It also doesn't have a Makefile.
+                        ===  Skipping Unit tests.
+                        ============================================""".stripIndent()
+                    }
+
+                    if (env.RUN_SIMPLE_TEST) {
+                        sh 'make -C testrunner simple-test VERBOSE=1'
+                    }
+                    // Check for core files - if present then archive them and the
+                    // executable they are from (for post-mortem) and fail the build.
+                    sh '''exec /bin/bash
+                    shopt -s nullglob
+                    ${BASEDIR}/archive_core_files.sh archived_core_dumps /tmp/core.*
+                    rm -f /tmp/core.*'''
+                }
+            }
+        }
+        stage("Static Analysis"){
+            when {
+                expression { getJobType() == 'clang_analyzer' }
+            }
+            steps {
+                script {
+                    env.SCAN_BUILD_PATH = sh(returnStdout: true, script: 'which $SCAN_BUILD || which scan-build-3.6')
+
+                    // Can't use ccache with clang analyzer - see
+                    // https://llvm.org/bugs/show_bug.cgi?id=25851
+                    env.CMAKE_ARGS="${CMAKE_ARGS} -DCOUCHBASE_DISABLE_CCACHE=1"
+
+                    env.REPORT_DIR="${pwd()}/clangScanBuildReports"
+                    def absCC = sh(returnStdout: true, script: 'which $CC')
+                    env.SCAN_BUILD_ARGS="--use-analyzer=${absCC} -o ${REPORT_DIR}"
+                }
+                // If we've checked out a specific version of the TLM
+                // then we'll need to bring our new CMakeLists.txt in manually
+                sh 'cp -f tlm/CMakeLists.txt ./CMakeLists.txt'
+
+                // We only want to build the Gerrit project under test,
+                // as we only want issues which are related to that project,
+                // and there doesn't appear to be a way to cull the results to a specific
+                // pattern / sub-directory.
+                // Therefore run cmake to generate all the makefiles, then just
+                // run make in the specific sub-directory.
+                sh 'mkdir -p build'
+                dir('build') {
+                    sh '$SCAN_BUILD_PATH ${SCAN_BUILD_ARGS} \
+                             cmake .. ${CMAKE_ARGS}'
+
+                    // The CMake configure step leaves an analyzer output run which
+                    // confuses the Jenkins scan-build plugin. Clean out the directory
+                    // before starting the actual build so we end up with just one report.
+                    sh 'rm -fr ${REPORT_DIR}/*'
+
+                    sh '$SCAN_BUILD_PATH ${SCAN_BUILD_ARGS} \
+                             make -C ${GERRIT_PROJECT} -j${PARALLELISM}'
+                 }
+            }
+        }
+    }
+    post {
+        always {
+            script {
+                if (getJobType() != 'clang_analyzer') {
+                    xunit(testTimeMargin: '3000', thresholdMode: 1,
+                          thresholds: [failed(failureThreshold: '0'),
+                                       skipped(failureThreshold: '0')],
+                          tools: [CTest(deleteOutputFiles: true,
+                                        failIfNotNew: true,
+                                        pattern: "build/${getProjectName()}/Testing/**/Test.xml",
+                                        skipNoTestFiles: false,
+                                        stopProcessingIfError: true)])
+                }
+            }
+            archiveArtifacts(allowEmptyArchive: true,
+                             artifacts: 'archived_core_dumps.tar.bz2')
+        }
+        success {
+            submitGerritVerifyStatus(1)
+            reportWarnings()
+        }
+        unstable {
+            reportWarnings()
+        }
+        failure {
+            submitGerritVerifyStatus(-1)
+        }
+    }
+}
+
+
+def getJobType() {
+    // e.g., kv_engine.ASan-UBSan.some_testing_change/master
+    // we want ASan-UBSan
+    return env.JOB_NAME.tokenize(".")[1]
+}
+
+def getJobName() {
+    // e.g., kv_engine.ASan-UBSan.some_testing_change/master
+    // we want kv_engine.ASan-UBSan.some_testing_change
+    return env.JOB_NAME.tokenize("/")[0]
+}
+
+def getProjectName() {
+    // e.g., kv_engine.ASan-UBSan.some_testing_change/master
+    // we want kv_engine
+    return env.JOB_NAME.tokenize(".")[0]
+}
+
+def getNodeLabel() {
+    def osLabel = (getJobName() == "windows" ? WINDOWS_NODE_LABEL : LINUX_NODE_LABEL)
+    return "${osLabel} && ${env.BRANCH_NAME}"
+}
+
+def getManifestFileName() {
+    if (env.BRANCH_NAME == 'master') {
+        return 'branch-master.xml'
+    } else {
+        return "couchbase-server/${env.BRANCH_NAME}.xml"
+    }
+}
+
+/**
+ * Submit compiler warnings to Jenkins
+ *
+ * Equivalent of the post-build "Scan for compiler warnings" action.
+ *
+ */
+def reportWarnings() {
+    def parser
+    def failedTotal = "${env.WARNING_THRESHOLD ? env.WARNING_THRESHOLD : 0}"
+
+    if (getJobName() == 'clang_analyzer') {
+        parser = 'Clang (LLVM based)'
+    } else {
+        parser = 'GNU Make + GNU C Compiler (gcc)'
+    }
+
+    warnings(canComputeNew: false, canResolveRelativePaths: false,
+             categoriesPattern: '', consoleParsers: [[parserName: parser]],
+             defaultEncoding: '', excludePattern: '',
+             failedTotalAll: failedTotal, healthy: '',
+             includePattern: '.*[/\\\\]kv_engine[/\\\\].*',
+             messagesPattern: '', unHealthy: '')
+}
+
+/**
+ * Report vote to Gerrit verify-status plugin.
+ *
+ * Adds the job result to the verify-status sidebar in the Gerrit patch
+ * view. This is hacky - the Jenkins plugin that does this for normal jobs
+ * does not appear to have been updated to be used from Pipelines.
+ * If a way of using the proper plugin is found, or it is updated, it should
+ * definitely replace this.
+ */
+def submitGerritVerifyStatus(value) {
+    if (env.GERRIT_PATCHSET_REVISION != null) {
+        // Directly report the verify status to Gerrit
+        // The jenkins plugin which reports to the verify-status sidebar does not seem to be up to date
+        // TODO: Investigate the HTTP API for greater portability (e.g., windows!)
+
+        def jobName = getJobName()
+        def url = "http://cv.jenkins.couchbase.com/job/${getJobName()}/job/${env.BRANCH_NAME}/${BUILD_NUMBER}/"
+        def duration = "${Util.getTimeSpanString(System.currentTimeMillis() - (env.startTime as Long))}"
+
+        sh """ssh -p ${env.GERRIT_PORT} buildbot@${env.GERRIT_HOST} \
+        -o "UserKnownHostsFile=/dev/null" -o "StrictHostKeyChecking=no" \
+        verify-status save --verification \
+        "'name=${jobName}|value=${value}|url=${url}|abstain=${SILENT}|reporter=buildbot|duration=${duration}'" \
+        ${GERRIT_PATCHSET_REVISION}"""
+    }
+}
+
+
+/**
+ * Read environment config files 
+ *
+ * Loads environment variables defined in jenkins-jobs/config/*.groovy files into the environment
+ * passed to shell steps.
+ */
+def loadEnvFiles() {
+    def jobName = getJobType()
+    // load env vars from groovy files in the config dir
+    // load common config first, then load overrides from the project specific directory
+    def base = "scripts/jenkins/commit_validation/jenkins-jobs/config/common/${jobName}.groovy"
+    def overrides = "scripts/jenkins/commit_validation/jenkins-jobs/config/${getProjectName()}/${jobName}.groovy"
+    for (fileName in [base, overrides]) {
+        echo "Checking for config file ${fileName}"
+        if (fileExists(fileName)) {
+            def closure = load fileName
+            addToEnv(closure)
+            echo "Loaded env from ${fileName}"
+        }
+    }
+}
+
+
+
+/**
+ * Execute a closure with delegate set to `env` 
+ *
+ * Helper method - used to execute closures defined in config files
+ * to add all defined variables to the `env` global.
+ */
+def addToEnv(closure) {
+    // The config files define a groovy closure.
+    // Setting the delegate to env and specifying DELEGATE_FIRST
+    // means variables assigned inside the closure are
+    // assigned "inside" env's scope - making them
+    // available as env vars in the same way
+    // env.FOO="BAR" does.
+    closure.resolveStrategy = Closure.DELEGATE_FIRST
+    closure.delegate = env
+    closure()
+}
